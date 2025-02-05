@@ -1,6 +1,7 @@
 #![feature(future_join)]
 #![feature(min_specialization)]
 #![feature(arbitrary_self_types)]
+#![feature(arbitrary_self_types_pointers)]
 
 use std::{str::FromStr, time::Instant};
 
@@ -8,10 +9,12 @@ use anyhow::{Context, Result};
 use futures_util::{StreamExt, TryStreamExt};
 use next_api::{
     project::{ProjectContainer, ProjectOptions},
-    route::{Endpoint, Route},
+    route::{endpoint_write_to_disk, Route},
 };
-use turbo_tasks::{RcStr, TransientInstance, TurboTasks, Vc};
-use turbopack_binding::turbo::{malloc::TurboMalloc, tasks_memory::MemoryBackend};
+use turbo_rcstr::RcStr;
+use turbo_tasks::{ReadConsistency, TransientInstance, TurboTasks, Vc};
+use turbo_tasks_malloc::TurboMalloc;
+use turbo_tasks_memory::MemoryBackend;
 
 pub async fn main_inner(
     tt: &TurboTasks<MemoryBackend>,
@@ -30,14 +33,19 @@ pub async fn main_inner(
 
     if matches!(strat, Strategy::Development { .. }) {
         options.dev = true;
-        options.watch = true;
+        options.watch.enable = true;
     } else {
         options.dev = false;
-        options.watch = false;
+        options.watch.enable = false;
     }
 
     let project = tt
-        .run_once(async { Ok(ProjectContainer::new(options)) })
+        .run_once(async {
+            let project = ProjectContainer::new("next-build-test".into(), options.dev);
+            let project = project.to_resolved().await?;
+            project.initialize(options).await?;
+            Ok(project)
+        })
         .await?;
 
     tracing::info!("collecting endpoints");
@@ -80,7 +88,7 @@ pub async fn main_inner(
     }
 
     if matches!(strat, Strategy::Development { .. }) {
-        hmr(tt, project).await?;
+        hmr(tt, *project).await?;
     }
 
     Ok(())
@@ -177,21 +185,21 @@ pub async fn render_routes(
                             html_endpoint,
                             data_endpoint: _,
                         } => {
-                            html_endpoint.write_to_disk().await?;
+                            endpoint_write_to_disk(*html_endpoint).await?;
                         }
                         Route::PageApi { endpoint } => {
-                            endpoint.write_to_disk().await?;
+                            endpoint_write_to_disk(*endpoint).await?;
                         }
                         Route::AppPage(routes) => {
                             for route in routes {
-                                route.html_endpoint.write_to_disk().await?;
+                                endpoint_write_to_disk(*route.html_endpoint).await?;
                             }
                         }
                         Route::AppRoute {
                             original_name: _,
                             endpoint,
                         } => {
-                            endpoint.write_to_disk().await?;
+                            endpoint_write_to_disk(*endpoint).await?;
                         }
                         Route::Conflict => {
                             tracing::info!("WARN: conflict {}", name);
@@ -251,16 +259,13 @@ async fn hmr(tt: &TurboTasks<MemoryBackend>, project: Vc<ProjectContainer>) -> R
             let session = session.clone();
             async move {
                 let project = project.project();
-                project
-                    .hmr_update(
-                        ident.clone(),
-                        project.hmr_version_state(ident.clone(), session),
-                    )
-                    .await?;
+                let state = project.hmr_version_state(ident.clone(), session);
+                project.hmr_update(ident.clone(), state).await?;
                 Ok(Vc::<()>::cell(()))
             }
         });
-        tt.wait_task_completion(task, true).await?;
+        tt.wait_task_completion(task, ReadConsistency::Strong)
+            .await?;
         let e = start.elapsed();
         if e.as_millis() > 10 {
             tracing::info!("HMR: {:?} {:?}", ident, e);

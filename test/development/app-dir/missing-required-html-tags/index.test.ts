@@ -3,6 +3,8 @@ import {
   assertHasRedbox,
   assertNoRedbox,
   getRedboxDescription,
+  getRedboxTotalErrorCount,
+  openRedbox,
   retry,
 } from 'next-test-utils'
 import { outdent } from 'outdent'
@@ -12,6 +14,13 @@ describe('app-dir - missing required html tags', () => {
 
   it('should show error overlay', async () => {
     const browser = await next.browser('/')
+
+    // There was a bug where multiple dialogs were being rendered when required
+    // html tags were missing. This test ensures there is no regression.
+    await retry(async () => {
+      const dialogs = await browser.elementsByCss('nextjs-portal')
+      expect(dialogs).toHaveLength(1)
+    })
 
     await assertHasRedbox(browser)
     expect(await getRedboxDescription(browser)).toMatchInlineSnapshot(`
@@ -54,7 +63,13 @@ describe('app-dir - missing required html tags', () => {
       )
     )
 
-    await assertHasRedbox(browser)
+    await openRedbox(browser)
+    // TODO(NDX-768): Should show "missing tags" error
+    expect(await getRedboxDescription(browser)).toMatchInlineSnapshot(`
+      "In HTML, <p> cannot be a child of <#document>.
+      This will cause a hydration error."
+      `)
+    expect(await getRedboxTotalErrorCount(browser)).toBe(1)
 
     // Fix the issue again
     await next.patchFile('app/layout.js', (code) =>
